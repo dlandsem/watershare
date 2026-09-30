@@ -1,7 +1,9 @@
 /* WaterShare app (stage 1: works fully offline on the phone). */
 (function () {
   'use strict';
-  const APP_VERSION = '1.0.0';
+  const APP_VERSION = '2.0.0';
+  const WS = (window.WS = { actions: {} });
+  const hook = (name, ...a) => { try { if (WS[name]) WS[name](...a); } catch (e) { console.error(e); } };
   const { isNum } = Calc;
 
   /* ================= Helpers ================= */
@@ -41,13 +43,14 @@
   let db;
   function openDB() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open(DB_NAME, 1);
+      const r = indexedDB.open(DB_NAME, 2);
       r.onupgradeneeded = () => {
         const d = r.result;
         if (!d.objectStoreNames.contains('members')) d.createObjectStore('members', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('months')) d.createObjectStore('months', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('files')) d.createObjectStore('files', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv', { keyPath: 'key' });
+        if (!d.objectStoreNames.contains('expenses')) d.createObjectStore('expenses', { keyPath: 'id' });
       };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
@@ -69,12 +72,14 @@
   const dbPut = (s, v) => tx(s, 'readwrite', (st) => st.put(v));
   const dbDel = (s, k) => tx(s, 'readwrite', (st) => st.delete(k));
   const dbClear = (s) => tx(s, 'readwrite', (st) => st.clear());
+  const dbKeys = (s) => tx(s, 'readonly', (st) => st.getAllKeys());
 
   const urlCache = new Map();
-  async function saveFile(blob, name) {
+  async function saveFile(blob, name, meta = {}) {
     const id = uid();
     const data = await blob.arrayBuffer();
-    await dbPut('files', { id, type: blob.type || 'application/octet-stream', name, size: blob.size, data, createdAt: Date.now() });
+    await dbPut('files', { id, type: blob.type || 'application/octet-stream', name, size: blob.size, data, createdAt: Date.now(), ...meta });
+    hook('onFileAdded', id);
     return id;
   }
   async function getFileBlob(id) {
@@ -93,6 +98,7 @@
     if (!id) return;
     if (urlCache.has(id)) { URL.revokeObjectURL(urlCache.get(id)); urlCache.delete(id); }
     await dbDel('files', id);
+    hook('onFileDeleted', id);
   }
   async function hydrate(root) {
     for (const img of $$('img[data-file]', root)) {
@@ -135,26 +141,31 @@
   const DEFAULT_SETTINGS = {
     key: 'settings', systemName: '', feePct: 10, thresholdType: 'pct', thresholdValue: 5,
     utilityUnit: 'ccf', utilityStartReading: null, billUnit: 'ccf', lastBackup: null,
+    statementFooter: '', googleClientId: '',
   };
-  const S = { members: [], months: [], settings: { ...DEFAULT_SETTINGS }, view: { tab: 'months' } };
+  const S = { members: [], months: [], expenses: [], settings: { ...DEFAULT_SETTINGS }, view: { tab: 'months' } };
   let sheetCtx = null;
   let sheetGen = 0;
 
   async function loadAll() {
     S.members = await dbAll('members');
     S.months = await dbAll('months');
+    S.expenses = await dbAll('expenses');
     const st = await dbGet('kv', 'settings');
     S.settings = { ...DEFAULT_SETTINGS, ...(st || {}) };
   }
-  const ctx = () => ({ members: S.members, months: S.months, settings: S.settings });
+  const ctx = () => ({ members: S.members, months: S.months, expenses: S.expenses, settings: S.settings });
   const getMember = (id) => S.members.find((m) => m.id === id);
   const getMonth = (id) => S.months.find((m) => m.id === id);
   const activeMembers = () => S.members.filter((m) => m.status === 'active').sort(byName);
   const byName = (a, b) => a.name.localeCompare(b.name);
   const manager = () => S.members.find((m) => m.isManager && m.status !== 'removed');
-  async function putMonth(m) { await dbPut('months', m); const i = S.months.findIndex((x) => x.id === m.id); if (i >= 0) S.months[i] = m; else S.months.push(m); }
-  async function putMember(m) { await dbPut('members', m); const i = S.members.findIndex((x) => x.id === m.id); if (i >= 0) S.members[i] = m; else S.members.push(m); }
-  async function putSettings() { await dbPut('kv', S.settings); }
+  async function putMonth(m) { await dbPut('months', m); const i = S.months.findIndex((x) => x.id === m.id); if (i >= 0) S.months[i] = m; else S.months.push(m); hook('onChange'); }
+  async function putMember(m) { await dbPut('members', m); const i = S.members.findIndex((x) => x.id === m.id); if (i >= 0) S.members[i] = m; else S.members.push(m); hook('onChange'); }
+  async function putExpense(e) { await dbPut('expenses', e); const i = S.expenses.findIndex((x) => x.id === e.id); if (i >= 0) S.expenses[i] = e; else S.expenses.push(e); hook('onChange'); }
+  async function putSettings() { await dbPut('kv', S.settings); hook('onChange'); }
+  const getExpense = (id) => S.expenses.find((e) => e.id === id);
+  const monthsBack = (id, k) => { let [y, m] = id.split('-').map(Number); m -= k; while (m < 1) { m += 12; y--; } return `${y}-${pad(m)}`; };
   const sortedParticipants = (month) => month.participants.map(getMember).filter(Boolean).sort(byName);
 
   /* ================= UI primitives ================= */
@@ -186,7 +197,7 @@
 
   function topbar(title, sub, back) {
     return `<header class="topbar">${back ? `<button class="back" data-act="${back.act}" ${back.id ? `data-id="${esc(back.id)}"` : ''}>${I.chevL}${esc(back.label)}</button>` : ''}
-      <h1>${esc(title)}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</h1></header>`;
+      <h1>${esc(title)}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</h1>${WS.syncPill ? WS.syncPill() : ''}</header>`;
   }
 
   function renderTabs() {
@@ -199,7 +210,7 @@
     renderTabs();
     const v = S.view;
     let html;
-    if (v.tab === 'months') html = v.monthId && getMonth(v.monthId) ? viewMonth(getMonth(v.monthId)) : viewMonths();
+    if (v.tab === 'months') html = v.expenseId && getExpense(v.expenseId) ? viewExpense(getExpense(v.expenseId)) : v.monthId && getMonth(v.monthId) ? viewMonth(getMonth(v.monthId)) : viewMonths();
     else if (v.tab === 'history') html = v.memberId && getMember(v.memberId) ? viewMemberHistory(getMember(v.memberId)) : viewHistory();
     else html = viewSetup();
     const app = $('#app');
@@ -233,6 +244,22 @@
     }
     h += backupReminder();
     h += `<button class="btn block new-month" data-act="newMonth">${I.plus}Start a new month</button>`;
+    h += `<button class="btn block ghost" data-act="addExpense" style="margin-top:10px">${I.doc}Add another bill</button>`;
+    const exps = [...S.expenses].sort((a, b) => (b.billDate || '').localeCompare(a.billDate || '') || b.createdAt - a.createdAt);
+    if (exps.length) {
+      h += '<div class="group-title">Other bills</div><div class="group">';
+      for (const e of exps) {
+        const ec = Calc.computeExpense(e, ctx());
+        let meta;
+        if (!ec.shares) meta = 'Needs attention';
+        else if (e.billing === 'month') meta = getMonth(e.monthId) ? `On ${monthLabel(e.monthId)} statements` : 'Its month was deleted. Tap to choose another.';
+        else { const u = ec.shares.filter((x) => !x.isManager && !isPaid(e, x.id)).length; meta = `Billed separately, ${u ? `${u} unpaid` : 'all paid'}`; }
+        h += `<button class="row" data-act="openExpense" data-id="${e.id}"><span class="dot ${ec.shares ? 'ok' : 'warn'}"></span>
+          <span class="grow"><span class="title">${esc(e.name || 'Other bill')}</span><span class="meta">${esc(meta)}</span></span>
+          <span class="end">${ec.totals ? `<span class="big">${money(ec.totals.billTotal)}</span>` : ''}</span>${I.chevR}</button>`;
+      }
+      h += '</div>';
+    }
     const months = Calc.sortedMonths(S.months).reverse();
     if (!months.length) {
       h += '<p class="note-text">Your months will appear here. To enter past months, start a new month and pick an earlier date.</p>';
@@ -243,6 +270,7 @@
       const c = Calc.computeMonth(m, ctx());
       const bits = [`${c.readCount} of ${c.n} read`];
       bits.push(c.billReady ? 'bill entered' : 'no bill yet');
+      if (c.shares) { const u = c.shares.filter((x) => !x.isManager && !isPaid(m, x.id)).length; bits.push(u ? `${u} unpaid` : 'all paid'); }
       if (c.checksum && c.checksum.pct != null) bits.push(`${num(c.checksum.pct, 1)}% difference`);
       h += `<button class="row" data-act="openMonth" data-id="${m.id}">
         <span class="dot ${monthStatus(c)}"></span>
@@ -253,7 +281,7 @@
   }
 
   function backupReminder() {
-    if (!S.months.length) return '';
+    if (!S.months.length || (WS.syncConnected && WS.syncConnected())) return '';
     const last = S.settings.lastBackup;
     const days = last ? Math.floor((Date.now() - last) / 86400000) : null;
     if (days != null && days < 30) return '';
@@ -325,6 +353,12 @@
       h += `<button class="btn block quiet" data-act="editBill">${I.doc}Enter the utility bill</button>`;
     }
 
+    if (c.attached.length) {
+      h += '<div class="group-title">Other bills on these statements</div><div class="group">';
+      for (const e of c.attached) h += `<button class="row" data-act="openExpense" data-id="${e.id}"><span class="thumb empty">${I.doc}</span><span class="grow"><span class="title">${esc(e.name || 'Other bill')}</span><span class="meta">Split over ${shortMonth(e.rangeStart)} to ${shortMonth(e.rangeEnd)}</span></span>${I.chevR}</button>`;
+      h += '</div>';
+    }
+
     // Charges
     h += '<div class="group-title">Member charges</div>';
     if (c.blockers.length) {
@@ -337,7 +371,9 @@
           <dl class="charge-lines"><dt>Water used</dt><dd>${vol(s.usage)} (${num(s.frac * 100, 1)}%)</dd>
           <dt>Base fee share</dt><dd>${money(s.base)}</dd><dt>Usage fee share</dt><dd>${money(s.usageAmt)}</dd>
           ${s.extras.map((e) => `<dt>${esc(e.name)}</dt><dd>${money(e.amount)}</dd>`).join('')}
-          <dt>Management fee${s.isManager ? '' : ` (${num(c.totals.feePct)}%)`}</dt><dd>${s.isManager ? 'None' : money(s.fee)}</dd></dl></div>`;
+          <dt>Management fee${s.isManager ? '' : ` (${num(c.totals.feePct)}%)`}</dt><dd>${s.isManager ? 'None' : money(s.fee)}</dd>
+          ${s.expenses.map((e) => `<dt>${esc(e.name)}${e.fee ? ' (with fee)' : ''}</dt><dd>${money(e.total)}</dd>`).join('')}</dl>
+          ${chargeActions('month', m, s)}</div>`;
       }
       h += '</div>';
       const t = c.totals;
@@ -346,8 +382,11 @@
         <dt>Shares before fees</dt><dd>${money(t.sharesTotal)}</dd>
         ${t.rounding !== 0 ? `<dt>Rounding difference</dt><dd>${t.rounding > 0 ? '+' : ''}${money(t.rounding)}</dd>` : ''}
         ${t.managerShare != null ? `<dt>Your own share</dt><dd>${money(t.managerShare)}</dd>` : ''}
+        ${t.expensesTotal ? `<dt>Other bills on these statements</dt><dd>${money(t.expensesTotal)}</dd>` : ''}
         <dt>Management fees</dt><dd>${money(t.fees)}</dd>
-        <dt class="strong">Members owe you</dt><dd>${money(t.owedToManager)}</dd></dl></div>`;
+        <dt class="strong">Members owe you</dt><dd>${money(t.owedToManager)}</dd>
+        ${paidSoFar(m, c.shares)}</dl></div>`;
+      for (const note of c.attachedNotes) h += `<div class="callout"><p>${esc(note)}</p></div>`;
       if (t.managerShare == null) h += '<div class="callout"><p>No manager is set for this month, so everyone pays the management fee. Set the manager in this month\'s settings.</p></div>';
     }
 
@@ -541,7 +580,7 @@
     let photoId = c.removePhoto ? null : c.existingPhotoId;
     if (c.photoBlob) {
       const name = mem ? `${m.id}_${slug(mem.name)}_meter.jpg` : `${m.id}_utility-meter.jpg`;
-      photoId = await saveFile(c.photoBlob, name);
+      photoId = await saveFile(c.photoBlob, name, { kind: 'meter', monthId: m.id });
       if (c.existingPhotoId) await deleteFile(c.existingPhotoId);
     } else if (c.removePhoto && c.existingPhotoId) {
       await deleteFile(c.existingPhotoId);
@@ -668,7 +707,7 @@
     let pdfId = c.removePdf ? null : c.existingPdfId;
     if (c.pdfBlob) {
       const ext = c.pdfBlob.type === 'application/pdf' ? 'pdf' : 'jpg';
-      pdfId = await saveFile(c.pdfBlob, `${m.id}_utility-bill.${ext}`);
+      pdfId = await saveFile(c.pdfBlob, `${m.id}_utility-bill.${ext}`, { kind: 'bill', monthId: m.id });
       if (c.existingPdfId) await deleteFile(c.existingPdfId);
     } else if (c.removePdf && c.existingPdfId) await deleteFile(c.existingPdfId);
     m.bill = {
@@ -719,9 +758,270 @@
     if (m.utility && m.utility.photoId) await deleteFile(m.utility.photoId);
     if (m.bill && m.bill.pdfId) await deleteFile(m.bill.pdfId);
     await dbDel('months', m.id);
+    hook('onChange');
     S.months = S.months.filter((x) => x.id !== m.id);
     toast(`${monthLabel(m.id)} deleted`);
     go({ monthId: null });
+  }
+
+  /* ================= Payments and statements ================= */
+  const isPaid = (cont, id) => !!(cont.payments && cont.payments[id] && cont.payments[id].paid);
+  const shortDate = (ts) => new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const getCont = (kind, id) => (kind === 'month' ? getMonth(id) : getExpense(id));
+  const putCont = (kind, c) => (kind === 'month' ? putMonth(c) : putExpense(c));
+  function shareFor(kind, cont, memberId) {
+    const c = kind === 'month' ? Calc.computeMonth(cont, ctx()) : Calc.computeExpense(cont, ctx());
+    return { c, s: c.shares ? c.shares.find((x) => x.id === memberId) : null };
+  }
+  function paidSoFar(cont, shares) {
+    const owing = shares.filter((x) => !x.isManager);
+    if (!owing.length) return '';
+    const paid = owing.filter((x) => isPaid(cont, x.id));
+    return `<dt>Paid so far</dt><dd>${money(Calc.r2(paid.reduce((a, x) => a + x.total, 0)))} (${paid.length} of ${owing.length})</dd>`;
+  }
+  function chargeActions(kind, cont, s) {
+    if (s.isManager) return '';
+    const pay = (cont.payments || {})[s.id];
+    const sent = (cont.sent || {})[s.id];
+    const bits = [];
+    if (sent) bits.push(`Statement sent ${shortDate(sent)}`);
+    if (pay && pay.paid) bits.push(`Paid${pay.date ? ` ${dateLabel(pay.date)}` : ''}${pay.note ? `, ${pay.note}` : ''}`);
+    return `<div class="charge-actions">
+      <button class="btn small quiet" data-act="sendStatement" data-kind="${kind}" data-cid="${esc(cont.id)}" data-id="${s.id}">Send statement</button>
+      <button class="btn small ${pay && pay.paid ? 'paid' : 'ghost'}" data-act="payment" data-kind="${kind}" data-cid="${esc(cont.id)}" data-id="${s.id}">${pay && pay.paid ? 'Paid' : 'Mark paid'}</button></div>
+      ${bits.length ? `<p class="charge-status">${esc(bits.join('. '))}.</p>` : ''}`;
+  }
+
+  function sheetPayment(kind, cid, memberId) {
+    const cont = getCont(kind, cid);
+    const mem = getMember(memberId);
+    const pay = (cont.payments || {})[memberId] || {};
+    const { s } = shareFor(kind, cont, memberId);
+    sheetCtx = { kind, cid, memberId };
+    const what = kind === 'month' ? monthLabel(cont.id) : cont.name;
+    openSheet(`Payment from ${mem.name}`, `<p class="note-text">${esc(what)}: ${money(s ? s.total : null)} due.</p>
+      <div class="group">${switchRow('pPaid', 'Paid', null, pay.paid !== false)}
+        ${field('Date paid', `<input type="date" id="pDate" value="${esc(pay.date || today())}">`)}
+        ${field('Note', `<input type="text" id="pNote" value="${esc(pay.note || '')}" placeholder="For example: check #1042 or Venmo">`)}</div>
+      <div class="btn-row"><button class="btn" data-act="savePayment">Save</button></div>`);
+  }
+  async function savePayment() {
+    const c = sheetCtx;
+    const cont = getCont(c.kind, c.cid);
+    cont.payments = cont.payments || {};
+    if ($('#pPaid').checked) cont.payments[c.memberId] = { paid: true, date: $('#pDate').value || null, note: $('#pNote').value.trim() };
+    else delete cont.payments[c.memberId];
+    await putCont(c.kind, cont);
+    closeSheet(); render();
+    toast('Payment saved');
+  }
+
+  function statementText(kind, cont, memberId) {
+    const sys = S.settings.systemName;
+    const L = [];
+    let subject;
+    if (kind === 'month') {
+      const c = Calc.computeMonth(cont, ctx());
+      const s = c.shares.find((x) => x.id === memberId);
+      const p = c.participants.find((x) => x.id === memberId);
+      const r = cont.readings[memberId] || {};
+      subject = `${sys ? sys + ' w' : 'W'}ater bill for ${monthLabel(cont.id)}`;
+      L.push(subject);
+      if (p.overridden) L.push(`Water used: ${vol(s.usage)} (adjusted${r.override && r.override.note ? `: ${r.override.note}` : ''})`);
+      else if (p.replaced) L.push(`Meter replaced this month. Water used: ${vol(s.usage)}`);
+      else if (p.prev && isNum(r.value)) L.push(`Meter: ${num(p.prev.raw, 3)} to ${num(r.value, 3)} ${unitLabel(r.unit)} (${vol(s.usage)} used)`);
+      L.push(`Base fee share: ${money(s.base)}`, `Usage share: ${money(s.usageAmt)}`);
+      for (const e of s.extras) L.push(`${e.name}: ${money(e.amount)}`);
+      L.push(`Management fee (${num(c.totals.feePct)}%): ${money(s.fee)}`);
+      for (const e of s.expenses) L.push(`${e.name}: ${money(e.total)}${e.fee ? ' (includes management fee)' : ''}`);
+      L.push('', `Total due: ${money(s.total)}`);
+    } else {
+      const ec = Calc.computeExpense(cont, ctx());
+      const s = ec.shares.find((x) => x.id === memberId);
+      subject = `${sys ? sys + ': ' : ''}${cont.name}`;
+      L.push(subject);
+      if (cont.period) L.push(`Period: ${cont.period}`);
+      if (s.equal) L.push(`Equal share: ${money(s.equal)}`);
+      if (cont.amountUsage) {
+        L.push(`Your water use, ${shortMonth(cont.rangeStart)} to ${shortMonth(cont.rangeEnd)}: ${vol(s.usage)} (${num(s.frac * 100, 1)}% of the total)`);
+        L.push(`Usage share: ${money(s.usageAmt)}`);
+      }
+      if (s.fee) L.push(`Management fee (${num(ec.totals.feePct)}%): ${money(s.fee)}`);
+      L.push('', `Total due: ${money(s.total)}`);
+    }
+    if (S.settings.statementFooter) L.push('', S.settings.statementFooter);
+    return { text: L.join('\n'), subject };
+  }
+  function sheetStatement(kind, cid, memberId) {
+    const cont = getCont(kind, cid);
+    const mem = getMember(memberId);
+    const st = statementText(kind, cont, memberId);
+    const phone = (mem.phone || '').replace(/[^\d+]/g, '');
+    sheetCtx = { kind, cid, memberId, subject: st.subject, phone, email: (mem.email || '').trim() };
+    openSheet(`Statement for ${mem.name}`, `<div class="group"><label class="field"><span class="lbl">Message</span>
+        <textarea id="stText" rows="12">${esc(st.text)}</textarea><span class="hint">You can edit the message before sending.</span></label></div>
+      <div class="btn-row">${phone ? '<button class="btn" data-act="sendVia" data-id="sms">Text</button>' : ''}${sheetCtx.email ? '<button class="btn" data-act="sendVia" data-id="email">Email</button>' : ''}
+        <button class="btn quiet" data-act="sendVia" data-id="share">Share</button></div>
+      ${!phone && !sheetCtx.email ? '<p class="note-text">Add a phone number or email for this member in Setup to text or email them directly.</p>' : ''}`);
+  }
+  function openLink(href) { const a = document.createElement('a'); a.href = href; document.body.appendChild(a); a.click(); a.remove(); }
+  async function sendVia(how) {
+    const c = sheetCtx;
+    const text = $('#stText').value;
+    if (how === 'sms') openLink(`sms:${c.phone}&body=${encodeURIComponent(text)}`);
+    else if (how === 'email') openLink(`mailto:${c.email}?subject=${encodeURIComponent(c.subject)}&body=${encodeURIComponent(text)}`);
+    else {
+      try {
+        if (navigator.share) await navigator.share({ text });
+        else { await navigator.clipboard.writeText(text); toast('Statement copied'); }
+      } catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    const cont = getCont(c.kind, c.cid);
+    cont.sent = cont.sent || {};
+    cont.sent[c.memberId] = Date.now();
+    await putCont(c.kind, cont);
+    closeSheet(); render();
+  }
+
+  /* ================= Other bills (periodic expenses) ================= */
+  function viewExpense(e) {
+    const ec = Calc.computeExpense(e, ctx());
+    const sub = [e.billDate ? `Dated ${dateLabel(e.billDate)}` : '', e.period].filter(Boolean).join(', ') || null;
+    let h = topbar(e.name || 'Other bill', sub, { act: 'backToMonths', label: 'Months' });
+    h += '<div class="page">';
+    const total = Calc.r2((e.amountEqual || 0) + (e.amountUsage || 0));
+    const onMonth = e.billing === 'month' && getMonth(e.monthId);
+    h += `<div class="group-title">Bill</div><div class="group">
+      <button class="row" data-act="editExpense" data-id="${e.id}"><span class="grow"><span class="title">${money(total)}</span><span class="meta">Tap to edit</span></span>${I.chevR}</button>
+      <dl class="totals" style="border-top:1px solid var(--line);margin:0">
+        <dt>Split equally</dt><dd>${money(e.amountEqual || 0)}</dd>
+        <dt>Split by water usage</dt><dd>${money(e.amountUsage || 0)}</dd>
+        <dt>Usage counted</dt><dd>${shortMonth(e.rangeStart)} to ${shortMonth(e.rangeEnd)}</dd>
+        <dt>Management fee</dt><dd>${e.feeApplies ? `${num(e.feePct)}%` : 'Not added'}</dd>
+        <dt>Billed</dt><dd>${e.billing === 'month' ? (onMonth ? `On ${monthLabel(e.monthId)} statements` : 'Choose a month') : 'Separate statements'}</dd></dl>
+      ${e.pdfId ? `<button class="row" data-act="viewFile" data-id="${e.pdfId}"><span class="thumb empty">${I.doc}</span><span class="grow"><span class="title">View the bill</span><span class="meta">Opens the saved PDF or photo</span></span>${I.chevR}</button>` : ''}</div>`;
+    if (onMonth) h += `<div class="btn-row"><button class="btn quiet" data-act="openMonth" data-id="${e.monthId}">Open ${monthLabel(e.monthId)}</button></div>`;
+
+    h += '<div class="group-title">Member charges</div>';
+    if (ec.blockers.length) h += `<div class="callout info">${ec.blockers.map((b) => `<p>${esc(b)}</p>`).join('')}</div>`;
+    else {
+      h += '<div class="group">';
+      for (const s of [...ec.shares].sort((a, b) => byName(a.member, b.member))) {
+        h += `<div class="charge"><div class="charge-head"><span class="name">${esc(s.member.name)}${s.isManager ? ' <span class="tag main">Manager</span>' : ''}</span><span class="total">${money(s.total)}</span></div>
+          <dl class="charge-lines">${e.amountUsage ? `<dt>Water used in range</dt><dd>${vol(s.usage)} (${num(s.frac * 100, 1)}%)</dd>` : ''}
+          ${e.amountEqual ? `<dt>Equal share</dt><dd>${money(s.equal)}</dd>` : ''}${e.amountUsage ? `<dt>Usage share</dt><dd>${money(s.usageAmt)}</dd>` : ''}
+          <dt>Management fee</dt><dd>${s.isManager || !e.feeApplies ? 'None' : money(s.fee)}</dd></dl>
+          ${e.billing === 'separate' ? chargeActions('expense', e, s) : ''}</div>`;
+      }
+      h += '</div>';
+      const t = ec.totals;
+      h += `<div class="group" style="margin-top:12px"><dl class="totals">
+        <dt>Bill total</dt><dd>${money(t.billTotal)}</dd><dt>Shares before fees</dt><dd>${money(t.sharesTotal)}</dd>
+        ${t.rounding !== 0 ? `<dt>Rounding difference</dt><dd>${t.rounding > 0 ? '+' : ''}${money(t.rounding)}</dd>` : ''}
+        ${t.managerShare != null ? `<dt>Your own share</dt><dd>${money(t.managerShare)}</dd>` : ''}
+        <dt>Management fees</dt><dd>${money(t.fees)}</dd><dt class="strong">Members owe you</dt><dd>${money(t.owedToManager)}</dd>
+        ${e.billing === 'separate' ? paidSoFar(e, ec.shares) : ''}</dl></div>`;
+    }
+    for (const w of ec.warnings) h += `<div class="callout"><p>${esc(w)}</p></div>`;
+    const mgr = getMember(e.managerId);
+    h += `<div class="group-title">This bill's settings</div><div class="group">
+      <button class="row" data-act="expenseSettings"><span class="grow"><span class="title">Members included</span><span class="meta">${ec.n} member${ec.n === 1 ? '' : 's'} share this bill</span></span>${I.chevR}</button>
+      <button class="row" data-act="expenseSettings"><span class="grow"><span class="title">Manager and fee</span><span class="meta">${esc(mgr ? mgr.name : 'No manager')}, ${num(isNum(e.feePct) ? e.feePct : 10)}% fee when added</span></span>${I.chevR}</button></div>
+      <div class="btn-row"><button class="btn danger" data-act="deleteExpense">Delete this bill</button></div>`;
+    return h + '</div>';
+  }
+
+  function sheetExpense(id) {
+    const months = Calc.sortedMonths(S.months);
+    const latest = months[months.length - 1];
+    const end = latest ? latest.id : currentMonthId();
+    const e = id ? getExpense(id) : { name: 'Power bill', billDate: '', period: '', amountEqual: null, amountUsage: null, rangeStart: monthsBack(end, 11), rangeEnd: end, feeApplies: false, billing: 'month', monthId: latest ? latest.id : null, pdfId: null };
+    sheetCtx = { expenseId: id, existingPdfId: e.pdfId || null, pdfBlob: null, pdfName: null, removePdf: false };
+    const monthOpts = [...months].reverse().map((m) => `<option value="${m.id}" ${m.id === e.monthId ? 'selected' : ''}>${monthLabel(m.id)}</option>`).join('');
+    const body = `<div class="group">
+        ${field('Name', `<input type="text" id="eName" value="${esc(e.name)}" placeholder="For example: Power bill 2026">`)}
+        ${field('Bill date', `<input type="date" id="eDate" value="${esc(e.billDate || '')}">`)}
+        ${field('Service period', `<input type="text" id="ePeriod" value="${esc(e.period || '')}" placeholder="For example: Oct 2025 to Sep 2026">`)}</div>
+      <div class="group-title">Amounts</div><div class="group">
+        ${field('Split equally', `<span class="money"><input id="eEq" inputmode="decimal" value="${valStr(e.amountEqual)}" placeholder="0.00"></span>`, 'Divided evenly among the included members.')}
+        ${field('Split by water usage', `<span class="money"><input id="eUs" inputmode="decimal" value="${valStr(e.amountUsage)}" placeholder="0.00"></span>`, 'Divided by each member\'s total water usage over the months below.')}</div>
+      <div class="group-title">Months of usage to count</div><div class="group">
+        <div class="field"><div class="inline"><label><span class="lbl">From</span><input type="month" id="eFrom" value="${esc(e.rangeStart)}"></label>
+          <label><span class="lbl">To</span><input type="month" id="eTo" value="${esc(e.rangeEnd)}"></label></div></div></div>
+      <div class="group-title">Management fee</div><div class="group">${switchRow('eFee', 'Add the management fee', 'Each member except the manager pays it on their share.', !!e.feeApplies)}</div>
+      <div class="group-title">How to bill it</div><div class="group">
+        <div class="field">${seg('eBill', [['month', 'On a month\'s statement'], ['separate', 'Separate statement']], e.billing)}</div>
+        <label class="field ${e.billing === 'month' ? '' : 'hidden'}" id="eMonthField"><span class="lbl">Add to</span>
+          ${months.length ? `<select id="eMonth">${monthOpts}</select>` : '<span class="hint">Start a month first.</span>'}</label></div>
+      <div class="group-title">Bill document</div>
+      <div class="group"><div class="photo-box" id="pdfBox">${pdfBoxInner()}</div></div>
+      <div class="btn-row"><button class="btn" data-act="saveExpense">${id ? 'Save bill' : 'Add bill'}</button></div>`;
+    const sheet = openSheet(id ? e.name : 'Add another bill', body, {
+      onChange: () => { const f = $('#eMonthField'); if (f) f.classList.toggle('hidden', radioVal(sheet, 'eBill') !== 'month'); },
+    });
+  }
+  async function saveExpense() {
+    const c = sheetCtx;
+    if (c.processing) await c.processing;
+    const sh = $('.sheet');
+    const name = $('#eName').value.trim();
+    const eq = numOrNull($('#eEq').value), us = numOrNull($('#eUs').value);
+    const from = $('#eFrom').value, to = $('#eTo').value, billing = radioVal(sh, 'eBill') || 'month';
+    const monthId = $('#eMonth') ? $('#eMonth').value : null;
+    if (!name) return toast('Give this bill a name.');
+    if (!eq && !us) return toast('Enter an amount to split equally, by usage, or both.');
+    if (!/^\d{4}-\d{2}$/.test(from) || !/^\d{4}-\d{2}$/.test(to) || from > to) return toast('Pick the months of usage to count, oldest first.');
+    if (billing === 'month' && !monthId) return toast('Pick the month to add this bill to.');
+    const old = c.expenseId ? getExpense(c.expenseId) : null;
+    const mgr = manager();
+    const e = {
+      ...(old || { id: uid(), createdAt: Date.now(), participants: activeMembers().map((x) => x.id), managerId: mgr && mgr.status === 'active' ? mgr.id : null, feePct: S.settings.feePct, payments: {}, sent: {} }),
+      name, billDate: $('#eDate').value || null, period: $('#ePeriod').value.trim(), amountEqual: eq, amountUsage: us,
+      rangeStart: from, rangeEnd: to, feeApplies: $('#eFee').checked, billing, monthId: billing === 'month' ? monthId : null,
+    };
+    let pdfId = c.removePdf ? null : c.existingPdfId;
+    if (c.pdfBlob) {
+      const ext = c.pdfBlob.type === 'application/pdf' ? 'pdf' : 'jpg';
+      pdfId = await saveFile(c.pdfBlob, `${e.billDate || today()}_${slug(name)}.${ext}`, { kind: 'expense' });
+      if (c.existingPdfId) await deleteFile(c.existingPdfId);
+    } else if (c.removePdf && c.existingPdfId) await deleteFile(c.existingPdfId);
+    e.pdfId = pdfId;
+    await putExpense(e);
+    closeSheet();
+    toast(old ? 'Bill saved' : `${name} added`);
+    go({ tab: 'months', monthId: null, expenseId: e.id });
+  }
+  function sheetExpenseSettings() {
+    const e = getExpense(S.view.expenseId);
+    const list = S.members.filter((x) => x.status !== 'removed' || e.participants.includes(x.id)).sort(byName);
+    sheetCtx = { expenseId: e.id, list };
+    openSheet(`${e.name} settings`, `<div class="group-title">Members sharing this bill</div><div class="group">
+      ${list.map((x) => switchRow('inc_' + x.id, esc(x.name), x.status === 'inactive' ? 'Currently inactive' : x.status === 'removed' ? 'Removed' : '', e.participants.includes(x.id))).join('')}</div>
+      <div class="group-title">Manager and fee</div><div class="group">
+      ${field('Manager', `<select id="xMgr"><option value="">No manager</option>${list.map((x) => `<option value="${x.id}" ${e.managerId === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select>`)}
+      ${field('Management fee (%)', `<input id="xFee" inputmode="decimal" value="${valStr(isNum(e.feePct) ? e.feePct : S.settings.feePct)}">`, 'Only used when the management fee is turned on for this bill.')}</div>
+      <div class="btn-row"><button class="btn" data-act="saveExpenseSettings">Save</button></div>`);
+  }
+  async function saveExpenseSettings() {
+    const e = getExpense(sheetCtx.expenseId);
+    const fee = numOrNull($('#xFee').value);
+    if (fee == null || fee < 0) return toast('Enter a management fee percentage.');
+    e.participants = sheetCtx.list.filter((x) => $('#inc_' + x.id).checked).map((x) => x.id);
+    e.managerId = $('#xMgr').value || null;
+    if (e.managerId && !e.participants.includes(e.managerId)) e.participants.push(e.managerId);
+    e.feePct = fee;
+    await putExpense(e);
+    closeSheet(); render(); toast('Bill settings saved');
+  }
+  async function deleteExpense() {
+    const e = getExpense(S.view.expenseId);
+    if (!confirm(`Delete ${e.name} and its document? This can't be undone.`)) return;
+    if (e.pdfId) await deleteFile(e.pdfId);
+    await dbDel('expenses', e.id);
+    S.expenses = S.expenses.filter((x) => x.id !== e.id);
+    hook('onChange');
+    toast(`${e.name} deleted`);
+    go({ expenseId: null });
   }
 
   /* ================= History ================= */
@@ -872,6 +1172,9 @@
       if (m.utility && m.utility.photoId === fileId) return [`Utility meter, ${monthLabel(m.id)}`, isNum(m.utility.value) ? `${num(m.utility.value, 3)} ${unitLabel(m.utility.unit)}` : '', m.id];
       if (m.bill && m.bill.pdfId === fileId) return [`Utility bill, ${monthLabel(m.id)}`, m.bill.period || '', m.id];
     }
+    for (const e of S.expenses) {
+      if (e.pdfId === fileId) return [e.name || 'Other bill', e.period || '', null];
+    }
     return ['File', '', null];
   }
 
@@ -905,11 +1208,14 @@
       <button class="row" data-act="editSettings"><span class="grow"><span class="title">Management fee</span><span class="meta">${num(s.feePct)}% for new months</span></span>${I.chevR}</button>
       <button class="row" data-act="editSettings"><span class="grow"><span class="title">Checksum warning</span><span class="meta">Warn when the difference is over ${thresholdText()}</span></span>${I.chevR}</button>
       <button class="row" data-act="editSettings"><span class="grow"><span class="title">Utility meter</span><span class="meta">Reads in ${unitLabel(s.utilityUnit)}, ${isNum(s.utilityStartReading) ? `starts at ${num(s.utilityStartReading, 3)}` : 'no starting reading'}</span></span>${I.chevR}</button>
-      <button class="row" data-act="editSettings"><span class="grow"><span class="title">System name</span><span class="meta">${esc(s.systemName || 'Not set')}</span></span>${I.chevR}</button></div>`;
+      <button class="row" data-act="editSettings"><span class="grow"><span class="title">System name</span><span class="meta">${esc(s.systemName || 'Not set')}</span></span>${I.chevR}</button>
+      <button class="row" data-act="editSettings"><span class="grow"><span class="title">Payment instructions</span><span class="meta">${esc(s.statementFooter || 'Added to the end of every statement')}</span></span>${I.chevR}</button></div>`;
+    h += `<div class="group-title">Google Drive</div>${WS.driveSection ? WS.driveSection() : ''}`;
 
     h += `<div class="group-title">Your data</div>
-      <div class="callout info"><p>For now, everything is stored only on this phone. Google Drive sync comes in the next update. Until then, save a backup file regularly to Files, OneDrive or Google Drive.</p></div>
+      ${WS.syncConnected && WS.syncConnected() ? '' : '<div class="callout info"><p>Until Google Drive sync is set up, everything is stored only on this phone. Save a backup file regularly to Files, OneDrive or Google Drive.</p></div>'}
       <div class="group" style="margin-top:12px">
+      <button class="row" data-act="exportData"><span class="grow"><span class="title">Export to Excel</span><span class="meta">Every month's readings, charges and payments, with or without photos</span></span>${I.chevR}</button>
       <button class="row" data-act="backup"><span class="grow"><span class="title">Save a backup file</span><span class="meta">${s.lastBackup ? `Last saved ${new Date(s.lastBackup).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}` : 'Never saved'}. Includes photos and bills.</span></span>${I.chevR}</button>
       <button class="row" data-act="restore"><span class="grow"><span class="title">Restore from a backup file</span><span class="meta">Replaces everything on this phone</span></span>${I.chevR}</button>
       <p class="note-text" id="storageInfo" style="border-top:1px solid var(--line)">Checking storage…</p></div>
@@ -988,6 +1294,7 @@
     } else {
       if (!confirm(`Delete ${m.name}? They have no readings yet, so nothing else is affected.`)) return;
       await dbDel('members', m.id);
+      hook('onChange');
       S.members = S.members.filter((x) => x.id !== m.id);
       for (const mo of S.months) if (mo.participants.includes(m.id)) {
         mo.participants = mo.participants.filter((x) => x !== m.id);
@@ -1001,6 +1308,8 @@
   function sheetSettings() {
     const s = S.settings;
     const body = `<div class="group">${field('System name', `<input type="text" id="sName" value="${esc(s.systemName)}" placeholder="For example: Cedar Lane Water">`)}</div>
+      <div class="group-title">Statements</div><div class="group">
+        ${field('Payment instructions', `<textarea id="sFooter" placeholder="For example: Venmo @cedar-lane-water or drop a check in my mailbox">${esc(s.statementFooter || '')}</textarea>`, 'Added to the end of every statement you send.')}</div>
       <div class="group-title">Management fee</div><div class="group">
         ${field('Percent added to each member\'s bill', `<input id="sFee" inputmode="decimal" value="${valStr(s.feePct)}">`, 'Applies to new months. Each month keeps its own rate, so changing this won\'t alter past bills.')}</div>
       <div class="group-title">Checksum warning</div><div class="group">
@@ -1019,7 +1328,7 @@
     if (fee == null || fee < 0) return toast('Enter a management fee percentage.');
     if (th == null || th < 0) return toast('Enter a checksum warning limit.');
     Object.assign(S.settings, {
-      systemName: $('#sName').value.trim(), feePct: fee, thresholdType: radioVal(sh, 'sThType') || 'pct', thresholdValue: th,
+      systemName: $('#sName').value.trim(), statementFooter: $('#sFooter').value.trim(), feePct: fee, thresholdType: radioVal(sh, 'sThType') || 'pct', thresholdValue: th,
       utilityUnit: radioVal(sh, 'sUUnit') || 'ccf', utilityStartReading: numOrNull($('#sUStart').value), billUnit: radioVal(sh, 'sBUnit') || 'ccf',
     });
     await putSettings();
@@ -1038,11 +1347,11 @@
   async function backup() {
     toast('Preparing backup…');
     const files = await dbAll('files');
-    const parts = [`{"app":"WaterShare","format":1,"version":${JSON.stringify(APP_VERSION)},"exportedAt":${JSON.stringify(new Date().toISOString())},`,
-      `"settings":${JSON.stringify(S.settings)},"members":${JSON.stringify(S.members)},"months":${JSON.stringify(S.months)},"files":[`];
+    const parts = [`{"app":"WaterShare","format":2,"version":${JSON.stringify(APP_VERSION)},"exportedAt":${JSON.stringify(new Date().toISOString())},`,
+      `"settings":${JSON.stringify(S.settings)},"members":${JSON.stringify(S.members)},"months":${JSON.stringify(S.months)},"expenses":${JSON.stringify(S.expenses)},"files":[`];
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
-      const meta = JSON.stringify({ id: f.id, type: f.type, name: f.name, size: f.size, createdAt: f.createdAt });
+      const meta = JSON.stringify({ id: f.id, type: f.type, name: f.name, size: f.size, createdAt: f.createdAt, kind: f.kind, monthId: f.monthId });
       parts.push((i ? ',' : '') + meta.slice(0, -1) + ',"data":"');
       parts.push(await blobToBase64(new Blob([f.data])));
       parts.push('"}');
@@ -1074,29 +1383,50 @@
     const when = data.exportedAt ? new Date(data.exportedAt).toLocaleString('en-US') : 'an unknown date';
     if (!confirm(`Replace everything on this phone with the backup from ${when}? It has ${data.months.length} months and ${data.members.length} members. This can't be undone.`)) return;
     toast('Restoring…');
-    for (const s of ['members', 'months', 'files', 'kv']) await dbClear(s);
-    for (const u of urlCache.values()) URL.revokeObjectURL(u);
-    urlCache.clear();
-    for (const m of data.members) await dbPut('members', m);
-    for (const m of data.months) await dbPut('months', m);
-    for (const x of data.files || []) {
-      await dbPut('files', { id: x.id, type: x.type, name: x.name, size: x.size, createdAt: x.createdAt, data: base64ToBuffer(x.data) });
-    }
-    await dbPut('kv', { ...DEFAULT_SETTINGS, ...data.settings, key: 'settings' });
-    await loadAll();
-    go({ tab: 'months', monthId: null, memberId: null });
+    const files = (data.files || []).map((x) => ({ id: x.id, type: x.type, name: x.name, size: x.size, createdAt: x.createdAt, kind: x.kind, monthId: x.monthId, data: base64ToBuffer(x.data) }));
+    await replaceAllData(data, files);
+    await hook('onRestored');
+    go({ tab: 'months', monthId: null, memberId: null, expenseId: null });
     toast('Backup restored');
   }
 
+  /* Replaces everything on the phone (used by restore and by downloading from Drive). */
+  async function replaceAllData(data, files) {
+    const keepClient = S.settings.googleClientId;
+    for (const st of ['members', 'months', 'expenses', 'files']) await dbClear(st);
+    for (const u of urlCache.values()) URL.revokeObjectURL(u);
+    urlCache.clear();
+    for (const m of data.members || []) await dbPut('members', m);
+    for (const m of data.months || []) await dbPut('months', m);
+    for (const e of data.expenses || []) await dbPut('expenses', e);
+    for (const f of files) await dbPut('files', f);
+    await dbPut('kv', { ...DEFAULT_SETTINGS, ...(data.settings || {}), googleClientId: keepClient || (data.settings && data.settings.googleClientId) || '', key: 'settings' });
+    await loadAll();
+  }
+  function buildData() {
+    return { app: 'WaterShare', format: 2, version: APP_VERSION, exportedAt: new Date().toISOString(), settings: S.settings, members: S.members, months: S.months, expenses: S.expenses };
+  }
+
   /* ================= Events ================= */
-  const actions = {
-    tab: (el) => go({ tab: el.dataset.id, monthId: null, memberId: null }),
+  const actions = Object.assign(WS.actions, {
+    tab: (el) => go({ tab: el.dataset.id, monthId: null, memberId: null, expenseId: null }),
+    openExpense: (el) => go({ tab: 'months', monthId: null, expenseId: el.dataset.id }),
+    addExpense: () => sheetExpense(null),
+    editExpense: (el) => sheetExpense(el.dataset.id),
+    saveExpense: () => saveExpense(),
+    expenseSettings: () => sheetExpenseSettings(),
+    saveExpenseSettings: () => saveExpenseSettings(),
+    deleteExpense: () => deleteExpense(),
+    payment: (el) => sheetPayment(el.dataset.kind, el.dataset.cid, el.dataset.id),
+    savePayment: () => savePayment(),
+    sendStatement: (el) => sheetStatement(el.dataset.kind, el.dataset.cid, el.dataset.id),
+    sendVia: (el) => sendVia(el.dataset.id),
     closeSheet: () => closeSheet(),
     newMonth: () => sheetNewMonth(),
     createMonth: () => createMonth(),
-    openMonth: (el) => go({ monthId: el.dataset.id }),
-    openMonthFromHistory: (el) => go({ tab: 'months', monthId: el.dataset.id }),
-    backToMonths: () => go({ monthId: null }),
+    openMonth: (el) => go({ monthId: el.dataset.id, expenseId: null }),
+    openMonthFromHistory: (el) => go({ tab: 'months', monthId: el.dataset.id, expenseId: null }),
+    backToMonths: () => go({ monthId: null, expenseId: null }),
     backToHistory: () => go({ memberId: null }),
     readMember: (el) => sheetReading('member', el.dataset.id),
     readUtility: () => sheetReading('utility'),
@@ -1129,7 +1459,7 @@
     backup: () => backup().catch((e) => toast('Backup failed: ' + e.message)),
     shareBackup: () => shareBackup().catch((e) => toast('Sharing failed: ' + e.message)),
     restore: () => restore().catch((e) => toast('Restore failed: ' + e.message)),
-  };
+  });
 
   document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-act]');
@@ -1146,11 +1476,18 @@
     $('button', slot).addEventListener('click', onClick);
   }
 
+  Object.assign(WS, {
+    S, esc, toast, render, go, ctx, today, icons: I, shareBlob, openSheet, closeSheet, buildData, replaceAllData,
+    dbGet, dbPut, dbAll, dbKeys,
+    setSheetCtx: (c) => { sheetCtx = c; }, getSheetCtx: () => sheetCtx,
+  });
+
   /* ================= Start ================= */
   async function start() {
     try {
       db = await openDB();
       await loadAll();
+      if (WS.onStart && (await WS.onStart()) === 'redirecting') return;
     } catch (e) {
       $('#app').innerHTML = `<div class="page"><div class="callout bad"><p>WaterShare couldn't open its storage on this phone: ${esc(e.message)}. If you're using a private browsing tab, open the app from its home-screen icon instead.</p></div></div>`;
       return;
@@ -1166,5 +1503,5 @@
       navigator.serviceWorker.register('sw.js').catch(() => {});
     }
   }
-  start();
+  document.addEventListener('DOMContentLoaded', start);
 })();

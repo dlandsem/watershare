@@ -9,6 +9,7 @@
   const r2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100;
   const toFt3 = (v, unit) => (unit === 'ccf' ? v * 100 : v);
   const sum = (arr) => arr.reduce((a, b) => a + b, 0);
+  const money2 = (n) => '$' + n.toFixed(2);
 
   function sortedMonths(months) {
     return [...months].sort((a, b) => a.id.localeCompare(b.id));
@@ -82,6 +83,55 @@
     return pct == null ? Math.abs(delta) > 0 : Math.abs(pct) > val;
   }
 
+  /* Periodic expense (like the annual power bill).
+     The equal portion is split evenly; the usage portion is prorated by each
+     member's total water usage across the chosen range of months. */
+  function computeExpense(exp, ctx) {
+    const months = sortedMonths(ctx.months).filter((m) => m.id >= exp.rangeStart && m.id <= exp.rangeEnd);
+    const participants = (exp.participants || []).map((id) => {
+      const member = ctx.members.find((m) => m.id === id) || { id, name: 'Unknown member' };
+      let usage = 0; let counted = 0; const gaps = [];
+      for (const m of months) {
+        if (!(m.participants || []).includes(id)) continue;
+        const u = memberUsage(m, id, ctx);
+        if (u.usage != null && u.usage >= 0) { usage += u.usage; counted++; } else gaps.push(m.id);
+      }
+      return { id, member, usage: Math.round(usage * 1000) / 1000, counted, gaps };
+    });
+    const n = participants.length;
+    const eq = isNum(exp.amountEqual) ? exp.amountEqual : 0;
+    const us = isNum(exp.amountUsage) ? exp.amountUsage : 0;
+    const totalUsage = sum(participants.map((p) => p.usage));
+    const blockers = [];
+    if (!n) blockers.push('No members are included in this bill.');
+    if (!eq && !us) blockers.push('Enter an amount to split.');
+    if (us && totalUsage <= 0 && n) blockers.push('No water usage is recorded for the included members in that range of months.');
+    const warnings = participants.filter((p) => p.gaps.length).map((p) => `${p.member.name} is missing usage for ${p.gaps.length} month${p.gaps.length === 1 ? '' : 's'} in the range.`);
+    let shares = null, totals = null;
+    if (!blockers.length) {
+      const feePct = isNum(exp.feePct) ? exp.feePct : 10;
+      shares = participants.map((p) => {
+        const frac = totalUsage > 0 ? p.usage / totalUsage : 0;
+        const equal = r2(eq / n);
+        const usageAmt = r2(us * frac);
+        const subtotal = r2(equal + usageAmt);
+        const isManager = p.id === exp.managerId;
+        const fee = exp.feeApplies && !isManager ? r2((subtotal * feePct) / 100) : 0;
+        return { id: p.id, member: p.member, usage: p.usage, frac, equal, usageAmt, subtotal, fee, total: r2(subtotal + fee), isManager };
+      });
+      const billTotal = r2(eq + us);
+      const sharesTotal = r2(sum(shares.map((x) => x.subtotal)));
+      const mgr = shares.find((x) => x.isManager);
+      totals = {
+        billTotal, sharesTotal, rounding: r2(sharesTotal - billTotal), feePct,
+        fees: r2(sum(shares.map((x) => x.fee))),
+        owedToManager: r2(sum(shares.filter((x) => !x.isManager).map((x) => x.total))),
+        managerShare: mgr ? mgr.subtotal : null,
+      };
+    }
+    return { participants, n, months: months.map((m) => m.id), totalUsage, blockers, warnings, shares, totals };
+  }
+
   /* Full month calculation. */
   function computeMonth(month, ctx) {
     const participants = (month.participants || []).map((id) => {
@@ -147,13 +197,36 @@
         owedToManager: r2(sum(shares.filter((s) => !s.isManager).map((s) => s.total))),
         managerShare: managerShare ? managerShare.subtotal : null,
         feePct,
+        expensesTotal: 0,
       };
+      shares.forEach((s) => { s.expenses = []; });
     }
 
-    return { participants, n, readCount: read.length, allRead, totalUsage, util, checksum, billReady, blockers, shares, totals };
+    // Periodic expenses added to this month's statements.
+    const attached = (ctx.expenses || []).filter((e) => e.billing === 'month' && e.monthId === month.id);
+    const attachedNotes = [];
+    if (shares) {
+      for (const e of attached) {
+        const ec = computeExpense(e, ctx);
+        if (!ec.shares) { attachedNotes.push(`${e.name || 'Other bill'} can't be added yet: ${ec.blockers.join(' ')}`); continue; }
+        for (const es of ec.shares) {
+          const s = shares.find((x) => x.id === es.id);
+          if (!s) { attachedNotes.push(`${es.member.name} isn't included this month, so their ${money2(es.total)} share of ${e.name || 'the other bill'} isn't on a statement.`); continue; }
+          s.expenses.push({ id: e.id, name: e.name || 'Other bill', subtotal: es.subtotal, fee: es.fee, total: es.total });
+          s.total = r2(s.total + es.total);
+        }
+        totals.expensesTotal = r2(totals.expensesTotal + ec.totals.billTotal);
+      }
+      totals.fees = r2(sum(shares.map((s) => s.fee + sum(s.expenses.map((e) => e.fee)))));
+      totals.owedToManager = r2(sum(shares.filter((s) => !s.isManager).map((s) => s.total)));
+      const ms = shares.find((s) => s.isManager);
+      if (ms) totals.managerShare = r2(ms.subtotal + sum(ms.expenses.map((e) => e.subtotal)));
+    }
+
+    return { attached, attachedNotes, participants, n, readCount: read.length, allRead, totalUsage, util, checksum, billReady, blockers, shares, totals };
   }
 
-  const api = { isNum, r2, toFt3, sortedMonths, prevMemberReading, prevUtilityReading, memberUsage, utilityUsage, usageFromReading, computeMonth, checksumWarn };
+  const api = { isNum, r2, toFt3, sortedMonths, prevMemberReading, prevUtilityReading, memberUsage, utilityUsage, usageFromReading, computeMonth, computeExpense, checksumWarn };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Calc = api;
 })(typeof window !== 'undefined' ? window : globalThis);

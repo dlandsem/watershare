@@ -370,3 +370,23 @@ table.hist tr[data-act]:active td { background: var(--surface-2); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* ---------- Stage 2 ---------- */
+.sync-pill {
+  display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; max-width: 46%;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink-2);
+  border-radius: 999px; padding: 6px 10px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.sync-pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-pill svg { width: 18px; height: 18px; flex-shrink: 0; }
+.sync-pill.ok { color: var(--ok); }
+.sync-pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.sync-pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+.sync-pill.busy { color: var(--main); }
+.sync-pill.busy svg { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.charge-actions { display: flex; gap: 8px; margin-top: 12px; }
+.charge-actions .btn { flex: 1; }
+.btn.paid { background: var(--ok-tint); color: var(--ok); }
+.btn.paid::before { content: "✓"; font-weight: 800; }
+.charge-status { margin: 8px 0 0; font-size: 13px; color: var(--ink-3); }

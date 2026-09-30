@@ -1,8 +1,9 @@
 /* WaterShare service worker: keeps the app working with no signal.
    When you upload a new version, change VERSION so phones pick it up. */
-const VERSION = 'watershare-v1.0.0';
+const VERSION = 'watershare-v2.0.0';
 const FILES = [
-  './', './index.html', './styles.css', './calc.js', './app.js', './manifest.webmanifest',
+  './', './index.html', './styles.css', './calc.js', './app.js', './sync.js', './export.js', './manifest.webmanifest',
+  './lib/xlsx.mini.min.js', './lib/jszip.min.js',
   './icons/apple-touch-icon.png', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-512-maskable.png'
 ];
 
